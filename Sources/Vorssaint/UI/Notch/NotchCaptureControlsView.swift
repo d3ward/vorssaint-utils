@@ -21,6 +21,14 @@ struct NotchCaptureControlsView: View {
                 Text(FeatureStrings.screenshot(l10n.language).screenCaptureTitle)
                     .font(.system(size: 12, weight: .semibold))
                 Spacer()
+                if options.offersRepeatLastRegion {
+                    Label("R", systemImage: "rectangle.dashed")
+                        .font(.system(size: 10, weight: .semibold, design: .rounded))
+                        .foregroundStyle(.secondary)
+                        .padding(.horizontal, 8)
+                        .frame(height: 26)
+                        .background(.white.opacity(0.06), in: RoundedRectangle(cornerRadius: 7))
+                }
                 NotchIconButton(symbol: "chevron.up", title: FeatureStrings.notch(l10n.language).collapse,
                                 action: service.collapseCaptureControls)
                     .focused($focusedControl, equals: .collapse)
@@ -31,7 +39,7 @@ struct NotchCaptureControlsView: View {
                 ForEach(options.showsCaptureMenu ? options.availableTools : [options.selectedTool], id: \.self) { tool in
                     NotchActionTile(symbol: tool.systemImageName,
                                     title: tool.settingsTitle(l10n.s, language: l10n.language),
-                                    active: options.selectedTool == tool, stacked: true) { options.select(tool) }
+                                    active: options.selectedTool == tool) { options.select(tool) }
                         .focused($focusedControl, equals: .tool(tool))
                 }
             }
@@ -53,11 +61,15 @@ private struct NotchRecordingAudioOptions: View {
     @ObservedObject private var l10n = L10n.shared
     var focusedControl: FocusState<NotchCaptureControl?>.Binding
     var body: some View {
-        HStack {
+        HStack(spacing: 16) {
             Toggle(FeatureStrings.recorder(l10n.language).systemAudioTrackLabel, isOn: $options.systemAudio)
                 .focused(focusedControl, equals: .systemAudio)
             Toggle(FeatureStrings.recorder(l10n.language).microphoneTrackLabel, isOn: $options.microphone)
                 .focused(focusedControl, equals: .microphone)
-        }.toggleStyle(.button).controlSize(.small)
+        }
+        .toggleStyle(.switch)
+        .tint(.green)
+        .controlSize(.small)
+        .fixedSize()
     }
 }
