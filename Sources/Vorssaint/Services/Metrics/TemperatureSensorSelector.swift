@@ -121,7 +121,15 @@ enum TemperatureSensorSelector {
             return appleM4CPUCoreKeys.contains(key)
         case .appleM5Family:
             return appleM5CPUCoreKeys.contains(key)
-        case .unmappedAppleSilicon, .generic:
+        case .unmappedAppleSilicon:
+            return false
+        case .generic:
+            if key == "TCMX" || key == "TCXC" || key == "TC0P" || key == "TC0D" { return true }
+            if key.count == 4 && key.hasPrefix("TC") {
+                let third = key[key.index(key.startIndex, offsetBy: 2)]
+                let fourth = key[key.index(key.startIndex, offsetBy: 3)]
+                return third.isNumber && (fourth == "C" || fourth == "D" || fourth == "E" || fourth == "F")
+            }
             return false
         }
     }
@@ -129,7 +137,12 @@ enum TemperatureSensorSelector {
     static func isCPUTemperatureKey(_ key: String,
                                     platform: CPUTemperaturePlatform) -> Bool {
         if key.hasPrefix("Tp") || key.hasPrefix("Te") { return true }
+        if platform == .generic && key.hasPrefix("TC") { return true }
         return platform == .appleM3Family && key.hasPrefix("Tf")
+    }
+
+    static func isGPUTemperatureKey(_ key: String) -> Bool {
+        key.hasPrefix("Tg") || key.hasPrefix("TG")
     }
 
     static func stabilizedTemperature(_ reading: Double?,
