@@ -13,7 +13,9 @@ struct NotchFileDropActions {
     var update: ((CGPoint) -> Bool)? = nil
 }
 
-enum NotchContentTransition { case none, reveal, dismiss, replace }
+/// `depart` keeps the leaving content on screen while the shape closes
+/// around it, fading out before the next content takes its place.
+enum NotchContentTransition { case none, reveal, dismiss, depart, replace }
 
 /// The window reserves the transition's bounds once. Core Animation moves
 /// the silhouette independently of SwiftUI layout and the application run loop.
@@ -32,12 +34,24 @@ final class NotchWindowHost: NSObject, CAAnimationDelegate {
     private var targetUsesGlass = false
     private var mouseEventsBeforeHide: Bool?
     private var frameProbe: NotchFrameProbe?
+    private var missionControlTimer: Timer?
+    private var concealedForMissionControl = false
+    private var missionControlAlpha: CGFloat = 1
+    private var missionControlMouseEvents = false
+    private var desktopReadings = 0
+    private var lastMissionControlCheck: TimeInterval = -.infinity
+    private var lastMissionControlProbe: TimeInterval = -.infinity
+    private var overviewWasVisible = false
+    private var restoringFromMissionControl = false
+    var missionControlDidRestore: (() -> Void)?
+    private let overlaySpace = NotchOverlaySpace()
     private var concealedForFrameChange = false
     private var restoresKeyAfterFrameChange = false
     private var settledActions: [() -> Void] = []
     private(set) var targetSize: CGSize
     private(set) var resizeCount = 0
     private(set) var concealedFrameChanges = 0
+    private(set) var missionControlFrameProbeCount = 0
 
     init(content: AnyView, geometry: NotchGeometry, size: CGSize,
          background: (NotchBackdropPresentation) -> AnyView = { _ in AnyView(Color.black) },
@@ -62,22 +76,57 @@ final class NotchWindowHost: NSObject, CAAnimationDelegate {
         // Stationary keeps the island in place when the desktop is revealed,
         // where files are dragged onto it; a transient overlay is swept away
         // with the windows. The two behaviors are mutually exclusive, and the
-        // stationary one also slides with the desktop between Spaces.
+        // stationary one also slides with the desktop between Spaces; the
+        // island's own Space, joined before it first shows, holds it in place.
         panel.collectionBehavior = NotchPanel.overlayCollectionBehavior
         panel.contentView = quickAccessContainer ?? canvas
         canvas.layoutSubtreeIfNeeded()
         appliedFrame = panel.frame
+        overlaySpace?.add(panel)
+        panel.visibilityDidChange = { [weak self] in self?.syncMissionControlMonitoring() }
     }
+
+    /// Whether leaving content is fading out with the shape rather than hidden at once.
+    var departsContent: Bool { canvas.departsContent }
+
+    /// The view has swapped out the departed content; the next one fades in.
+    func finishDeparture() { canvas.finishDeparture() }
 
     /// Visible, or ordered out for the few milliseconds of a concealed frame change.
     private var isPresented: Bool { panel.isVisible || concealedForFrameChange }
+    var isConcealedForMissionControl: Bool {
+        // Media-key taps can ask from a worker thread. Never touch AppKit or
+        // run the frame probe there; a panel being hidden cannot show feedback.
+        guard Thread.isMainThread else { return concealedForMissionControl || hidesWhenSettled }
+        // A hidden panel needs on-demand checks to detect Mission Control;
+        // once concealed, its timer keeps watching for the desktop to return.
+        if !panel.isVisible && !concealedForFrameChange { refreshMissionControlState() }
+        return concealedForMissionControl
+    }
 
-    func hide(animated: Bool) {
+    func blocksHoverReveal() -> Bool {
+        // Check again at the hover deadline: Mission Control can start while
+        // the pointer is waiting over the island's activation area.
+        refreshMissionControlState(now: true)
+        return concealedForMissionControl
+    }
+
+    func setMouseEventsIgnored(_ ignored: Bool) {
+        // Capture controls can change their click-through policy while the
+        // island is concealed or on its way out. Keep that policy for restore.
+        if concealedForMissionControl { missionControlMouseEvents = ignored }
+        if mouseEventsBeforeHide != nil { mouseEventsBeforeHide = ignored }
+        let effective = ignored || concealedForMissionControl || hidesWhenSettled
+        if panel.ignoresMouseEvents != effective { panel.ignoresMouseEvents = effective }
+    }
+
+    func hide(animated: Bool, transitionContent: NotchContentTransition = .dismiss) {
         guard isPresented else { return }
         let animate = animated && !NSWorkspace.shared.accessibilityDisplayShouldReduceMotion
         guard !hidesWhenSettled || !animate else { return }
         present(size: CGSize(width: currentGeometry.collapsed.width, height: 0), geometry: currentGeometry,
-                animated: animate, transitionContent: .dismiss, hideWhenSettled: true)
+                animated: animate, transitionContent: transitionContent == .depart ? .depart : .dismiss,
+                hideWhenSettled: true)
     }
 
     func present(size: CGSize, geometry: NotchGeometry, animated: Bool, transitionContent: NotchContentTransition = .none,
@@ -85,13 +134,16 @@ final class NotchWindowHost: NSObject, CAAnimationDelegate {
                  hideWhenSettled: Bool = false, usesGlass: Bool = false) {
         hidesWhenSettled = hideWhenSettled
         if hideWhenSettled {
-            if mouseEventsBeforeHide == nil { mouseEventsBeforeHide = panel.ignoresMouseEvents }
+            if mouseEventsBeforeHide == nil {
+                mouseEventsBeforeHide = concealedForMissionControl ? missionControlMouseEvents : panel.ignoresMouseEvents
+            }
             // The departing surface must already release the menu bar below it.
             panel.ignoresMouseEvents = true
         } else if let previous = mouseEventsBeforeHide {
             panel.ignoresMouseEvents = previous
             mouseEventsBeforeHide = nil
         }
+        if concealedForMissionControl { panel.ignoresMouseEvents = true }
         canvas.updateContrast()
         let revealing = revealFromHidden && !isPresented
         if isPresented || revealing {
@@ -117,6 +169,13 @@ final class NotchWindowHost: NSObject, CAAnimationDelegate {
         let changesFrame = revealing || (hideWhenSettled && !canAnimate) || size != targetSize
             || frame != previousFrame || (!isAnimating && panel.frame != appliedFrame)
         targetUsesGlass = usesGlass
+        if canAnimate && changesFrame && (usesGlass || canvas.usesGlass) {
+            // Glass closing into a black strip shuts as its page leaves, so the
+            // empty shell never shows the windows beneath it; opening out of one
+            // lets the glass in over the last stretch, as the page fades in.
+            let start = revealing ? 0 : canvas.visiblePath?.boundingBoxOfPath.height ?? targetSize.height
+            canvas.backdropPresentation.planFade(from: start, to: size.height, endsInGlass: usesGlass)
+        }
         // A shape still moving keeps its glass until it settles, even when an
         // unanimated refresh lands meanwhile: a click in Settings closes the
         // island and the option it changes syncs preferences mid-close.
@@ -128,7 +187,13 @@ final class NotchWindowHost: NSObject, CAAnimationDelegate {
             return
         }
         if canAnimate { canvas.transitionContent(revealing ? .reveal : transitionContent) }
-        else { canvas.restoreContent() }
+        else if animated && changesFrame && (revealing || transitionContent == .reveal) {
+            // Reduce Motion, or a panel that was ordered out, puts the island
+            // at its new size at once. Shown at once, the page reached the
+            // screen in the resting shape, flushed ahead of the resize, or
+            // ahead of the surface drawn beneath it. A fade is not motion.
+            canvas.transitionContent(.reveal, shapeSnaps: true)
+        } else { canvas.restoreContent() }
         guard changesFrame else { configureQuickAccess(); return }
         // An ordered-out panel still has its last expanded shape. Start the
         // reveal at the screen edge, even when reopening at that same size.
@@ -211,6 +276,8 @@ final class NotchWindowHost: NSObject, CAAnimationDelegate {
         isAnimating = false
         canvas.stopMotion()
         canvas.setUsesGlass(targetUsesGlass)
+        // Settled glass is fully open, whatever a cut-short transition planned.
+        if targetUsesGlass { canvas.backdropPresentation.openFully() }
         CATransaction.begin()
         CATransaction.setDisableActions(true)
         canvas.setContentSize(targetSize)
@@ -316,7 +383,7 @@ final class NotchWindowHost: NSObject, CAAnimationDelegate {
     }
 
     func containsHover(_ screenPoint: CGPoint) -> Bool {
-        guard isPresented else { return false }
+        guard isPresented, !concealedForMissionControl else { return false }
         // Hover follows the destination bounds, not a transient mask edge.
         // A resize must never turn a stationary pointer into an exit.
         if currentGeometry.contains(screenPoint, in: targetSize) { return true }
@@ -336,19 +403,104 @@ final class NotchWindowHost: NSObject, CAAnimationDelegate {
         for action in actions { DispatchQueue.main.async(execute: action) }
     }
 
+    /// The stationary island must stay on Show Desktop for file drops, but it
+    /// covers desktop names in Mission Control. A full-screen overview window
+    /// is the cheap hint, and the frame probe, which waits on the window
+    /// server, runs only while one is up or the island is concealed.
+    private func syncMissionControlMonitoring() {
+        guard panel.isVisible || concealedForMissionControl else {
+            missionControlTimer?.invalidate()
+            missionControlTimer = nil
+            return
+        }
+        if missionControlTimer == nil {
+            let timer = Timer(timeInterval: 0.08, repeats: true) { [weak self] _ in
+                self?.refreshMissionControlState()
+            }
+            timer.tolerance = 0.04
+            missionControlTimer = timer
+            RunLoop.main.add(timer, forMode: .common)
+        }
+        if panel.isVisible { refreshMissionControlState(now: true) }
+    }
+
+    private func refreshMissionControlState(now immediate: Bool = false) {
+        let now = ProcessInfo.processInfo.systemUptime
+        guard immediate || now - lastMissionControlCheck >= 0.08 else { return }
+        lastMissionControlCheck = now
+        let overview = NotchFrameProbe.overviewIsVisible(on: currentGeometry.screen)
+        let appeared = overview && !overviewWasVisible
+        overviewWasVisible = overview
+        // The window list costs a fraction of a millisecond; a probe reading
+        // waits up to a frame for the window server. Without an overview the
+        // desktop needs no reading at all. While one stays up the reading is
+        // repeated slowly, and once it closes the desktop is confirmed promptly.
+        guard overview || concealedForMissionControl else { return }
+        let interval = concealedForMissionControl && !overview ? 0.08 : 0.5
+        guard immediate || appeared || now - lastMissionControlProbe >= interval else { return }
+        lastMissionControlProbe = now
+        sampleMissionControl()
+    }
+
+    private func sampleMissionControl() {
+        missionControlFrameProbeCount += 1
+        let probe = frameProbe ?? NotchFrameProbe(collectionBehavior: panel.collectionBehavior)
+        frameProbe = probe
+        if probe.serverAnimatesFrames(level: panel.level, screen: currentGeometry.screen) {
+            desktopReadings = 0
+            guard !concealedForMissionControl else { panel.ignoresMouseEvents = true; return }
+            concealedForMissionControl = true
+            // Reopened during the fade back in, the panel is still on its way
+            // to the alpha kept from the first entry.
+            if !restoringFromMissionControl { missionControlAlpha = panel.alphaValue }
+            missionControlMouseEvents = mouseEventsBeforeHide ?? panel.ignoresMouseEvents
+            panel.ignoresMouseEvents = true
+            if panel.isVisible { fadeMissionControl(to: 0) }
+            else {
+                panel.alphaValue = 0
+                syncMissionControlMonitoring()
+            }
+        } else if concealedForMissionControl {
+            desktopReadings += 1
+            guard desktopReadings >= 3 else { return }
+            restoreFromMissionControl()
+        }
+    }
+
+    private func restoreFromMissionControl() {
+        concealedForMissionControl = false
+        desktopReadings = 0
+        panel.ignoresMouseEvents = hidesWhenSettled ? true : missionControlMouseEvents
+        if panel.isVisible {
+            restoringFromMissionControl = true
+            fadeMissionControl(to: missionControlAlpha) { [weak self] in self?.restoringFromMissionControl = false }
+        } else {
+            panel.alphaValue = missionControlAlpha
+            syncMissionControlMonitoring()
+        }
+        missionControlDidRestore?()
+    }
+
+    private func fadeMissionControl(to alpha: CGFloat, completion: (() -> Void)? = nil) {
+        NSAnimationContext.runAnimationGroup({ context in
+            context.duration = NSWorkspace.shared.accessibilityDisplayShouldReduceMotion ? 0 : 0.14
+            panel.animator().alphaValue = alpha
+        }, completionHandler: completion)
+    }
+
     var visibleFrame: CGRect {
         currentGeometry.frame(for: canvas.visiblePath?.boundingBoxOfPath.size ?? targetSize)
     }
 
     /// The island's own surface, without the floating controls beside it.
     func containsSurface(_ screenPoint: CGPoint) -> Bool {
-        guard isPresented else { return false }
+        guard isPresented, !concealedForMissionControl else { return false }
         return canvas.containsVisiblePoint(canvas.convert(panel.convertPoint(fromScreen: screenPoint), from: nil))
     }
 
     func contains(_ screenPoint: CGPoint) -> Bool {
         if containsSurface(screenPoint) { return true }
-        guard isPresented, let container = quickAccessContainer else { return false }
+        guard isPresented, !concealedForMissionControl, let container = quickAccessContainer else { return false }
         return container.motion.contains(container.convert(panel.convertPoint(fromScreen: screenPoint), from: nil))
     }
 
@@ -381,6 +533,9 @@ final class NotchWindowHost: NSObject, CAAnimationDelegate {
     var backdropProbePath: CGPath { canvas.backdropPresentation.contour.cgPath }
     var silhouetteProbePath: CGPath? { canvas.visiblePath }
     var backdropProbeUsesGlass: Bool { canvas.usesGlass }
+    var backdropProbeOpenness: Double { canvas.backdropPresentation.openness }
+    /// Nil where this macOS has no overlay Spaces to offer.
+    var overlayProbeHolds: Bool? { overlaySpace.map { $0.probeHolds(panel) } }
     var backdropProbeScheduled: Bool { canvas.backdropDisplayLink != nil }
     var backdropProbeTicks: Int { canvas.backdropTicks }
     func synchronizeBackdropProbe() { canvas.synchronizeBackdrop() }
@@ -408,6 +563,9 @@ final class NotchWindowHost: NSObject, CAAnimationDelegate {
     }
 
     func close() {
+        missionControlTimer?.invalidate()
+        missionControlTimer = nil
+        panel.visibilityDidChange = nil
         animationGeneration += 1
         isAnimating = false
         concealedForFrameChange = false
@@ -416,6 +574,7 @@ final class NotchWindowHost: NSObject, CAAnimationDelegate {
         quickAccessContainer?.setHoverRects([])
         panel.orderOut(nil)
         panel.contentView = nil
+        overlaySpace?.close()
         frameProbe?.close()
         frameProbe = nil
         runSettledActions()
@@ -455,6 +614,25 @@ private final class NotchFrameProbe {
             && abs(frame.width - other.width) <= 0.5 && abs(frame.height - other.height) <= 0.5
     }
 
+    /// On macOS 27 Mission Control and App Exposé cover the display with a
+    /// WindowManager window at layer 19; Show Desktop uses layer 18 and keeps
+    /// the island, and its own transition would read as animated. Earlier
+    /// systems had Dock's overview window at layer 18. This is only a reason
+    /// to run the frame probe, never a visibility decision by itself, and the
+    /// size check leaves Stage Manager's strip out.
+    static func overviewIsVisible(on screen: CGRect) -> Bool {
+        guard let windows = CGWindowListCopyWindowInfo([.optionOnScreenOnly], kCGNullWindowID)
+                as? [[String: Any]] else { return false }
+        return windows.contains { window in
+            let owner = window[kCGWindowOwnerName as String] as? String
+            let layer = window[kCGWindowLayer as String] as? Int
+            if owner == "Dock" { return layer == 18 }
+            guard owner == "WindowManager", layer == 19,
+                  let bounds = window[kCGWindowBounds as String] as? [String: CGFloat] else { return false }
+            return (bounds["Width"] ?? 0) >= screen.width - 1 && (bounds["Height"] ?? 0) >= screen.height - 1
+        }
+    }
+
     /// Keeps the probe on the island's display, below its menu bar so the
     /// space measurements never count it, at the island's own level.
     func attach(level: NSWindow.Level, screen: CGRect) {
@@ -475,6 +653,13 @@ private final class NotchFrameProbe {
     /// frame (5 ms median, 15 ms at the 90th percentile in the presentation
     /// checks); a direct window-server query waits just the same.
     func serverAnimatesFrames(level: NSWindow.Level, screen: CGRect) -> Bool {
+        if !window.isVisible {
+            // A panel created directly in hidden-until-hover mode has not
+            // primed this probe. Give the server a settled initial frame.
+            attach(level: level, screen: screen)
+            window.contentView?.layoutSubtreeIfNeeded()
+            CATransaction.flush()
+        }
         grown.toggle()
         attach(level: level, screen: screen)
         window.contentView?.layoutSubtreeIfNeeded()
@@ -501,6 +686,7 @@ final class NotchPanel: NSPanel {
     static let normalLevel = NSWindow.Level(rawValue: NSWindow.Level.statusBar.rawValue + 1)
     var acceptsKeyFocus = false
     var handleScroll: ((NSEvent) -> Bool)?
+    var visibilityDidChange: (() -> Void)?
     override var canBecomeKey: Bool { acceptsKeyFocus }
     override var canBecomeMain: Bool { false }
     // Liquid Glass swaps to a flat, blurred stand-in in a window that looks
@@ -521,6 +707,12 @@ final class NotchPanel: NSPanel {
     override func orderOut(_ sender: Any?) {
         if let sheet = attachedSheet { endSheet(sheet, returnCode: .cancel) }
         super.orderOut(sender)
+        visibilityDidChange?()
+    }
+
+    override func orderFrontRegardless() {
+        super.orderFrontRegardless()
+        visibilityDidChange?()
     }
 
     override func sendEvent(_ event: NSEvent) {
@@ -776,6 +968,10 @@ private final class NotchCanvas: NSView {
     var contentTopInWindow: CGPoint { host.convert(.zero, to: nil) }
 
     private static let motionKey = "notch.resize"
+    private static let departureKey = "notchDeparture"
+    var departsContent: Bool {
+        contentVisibility.animation(forKey: "notch.opacity")?.value(forKey: Self.departureKey) as? Bool == true
+    }
     var targetPath: CGPath? { silhouette.path }
     var visiblePath: CGPath? { silhouette.presentation()?.path ?? silhouette.path }
 
@@ -846,7 +1042,7 @@ private final class NotchCanvas: NSView {
 
     deinit { backdropDisplayLink?.invalidate() }
 
-    func transitionContent(_ kind: NotchContentTransition) {
+    func transitionContent(_ kind: NotchContentTransition, shapeSnaps: Bool = false) {
         guard kind != .none else { return }
         let currentOpacity = contentVisibility.presentation()?.opacity ?? contentVisibility.opacity
         contentVisibility.removeAnimation(forKey: "notch.opacity")
@@ -867,14 +1063,43 @@ private final class NotchCanvas: NSView {
             let start: Float = kind == .dismiss || currentOpacity == 1 ? 0 : currentOpacity
             // Give the silhouette a head start before revealing full-width
             // content. Reversals continue from the opacity already on screen.
+            // A shape that snaps into place only needs its first frames drawn.
             animation.values = [start, start, 1]
-            animation.keyTimes = kind == .dismiss ? [0, 0.65, 1] : [0, 0.625, 1]
-            animation.duration = 0.40
+            animation.keyTimes = kind == .dismiss ? [0, 0.65, 1] : shapeSnaps ? [0, 0.25, 1] : [0, 0.625, 1]
+            animation.duration = shapeSnaps ? 0.2 : 0.40
             animation.calculationMode = .linear
             animation.timingFunctions = [CAMediaTimingFunction(name: .linear), CAMediaTimingFunction(name: .easeOut)]
+            if kind == .depart {
+                // Departing content shrinks with the shape and stays hidden
+                // until the view has swapped it out, however late that is.
+                animation.values = [currentOpacity, 0]
+                animation.keyTimes = [0, 1]
+                animation.duration = 0.16
+                animation.timingFunctions = [CAMediaTimingFunction(name: .easeIn)]
+                animation.fillMode = .forwards
+                animation.isRemovedOnCompletion = false
+                animation.setValue(true, forKey: Self.departureKey)
+            }
             contentVisibility.opacity = 1
             contentVisibility.add(animation, forKey: "notch.opacity")
         }
+        CATransaction.commit()
+    }
+
+    func finishDeparture() {
+        guard departsContent else { return }
+        CATransaction.begin()
+        CATransaction.setDisableActions(true)
+        let animation = CABasicAnimation(keyPath: "opacity")
+        animation.fromValue = 0
+        animation.toValue = 1
+        // The swapped view reaches the screen with a later update.
+        animation.beginTime = CACurrentMediaTime() + 0.06
+        animation.fillMode = .backwards
+        animation.duration = 0.14
+        animation.timingFunction = CAMediaTimingFunction(name: .easeOut)
+        contentVisibility.removeAnimation(forKey: "notch.opacity")
+        contentVisibility.add(animation, forKey: "notch.opacity")
         CATransaction.commit()
     }
 

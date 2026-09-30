@@ -15,6 +15,7 @@ struct GeneralSettings: View {
     @ObservedObject private var hotkeys = HotkeyManager.shared
     @State private var launchAtLogin = LaunchAtLogin.isEnabled
     @State private var loginError: String?
+    @State private var musicBlockReplacementRejected = false
     @AppStorage(DefaultsKey.hotkeyEnabled) private var hotkeyEnabled = true
     @AppStorage(DefaultsKey.musicBlockEnabled) private var musicBlockEnabled = false
     @AppStorage(DefaultsKey.musicBlockReplacementPath) private var musicBlockReplacementPath = ""
@@ -34,6 +35,20 @@ struct GeneralSettings: View {
                 appearanceCard
                 menuBarCard
                     .settingsSectionAnchor(.panelConfiguration, cornerRadius: 16)
+                if AppFeature.mixer.isAvailable {
+                    MixerSection(settingsMode: true)
+                        .settingsSectionAnchor(.mixer, cornerRadius: 16)
+                }
+                if AppFeature.soundOutputSwitcher.isAvailable {
+                    SettingsCard(title: l10n.s.soundOutputSwitcherTitle) {
+                        SoundOutputSwitcherControls()
+                    }
+                    .settingsSectionAnchor(.soundOutputSwitcher, cornerRadius: 16)
+                }
+                if AppFeature.audioPriority.isAvailable {
+                    audioPriorityCard
+                        .settingsSectionAnchor(.audioPriority, cornerRadius: 16)
+                }
                 if AppFeature.keepAwake.isAvailable {
                     shortcutCard
                 }
@@ -134,6 +149,12 @@ struct GeneralSettings: View {
         }
     }
 
+    private var audioPriorityCard: some View {
+        SettingsCard(title: l10n.s.audioPrioritySection) {
+            AudioPriorityDisclosure(initiallyExpanded: true, showsHeader: false)
+        }
+    }
+
     private var shortcutCard: some View {
         SettingsCard(title: l10n.s.globalHotkeySection) {
             SettingsRow(symbol: "keyboard", title: l10n.s.hotkeyToggle, caption: l10n.s.hotkeyCaption) {
@@ -188,6 +209,7 @@ struct GeneralSettings: View {
                     if !musicBlockReplacementPath.isEmpty {
                         Button {
                             musicBlockReplacementPath = ""
+                            musicBlockReplacementRejected = false
                         } label: {
                             Image(systemName: "xmark.circle.fill")
                         }
@@ -196,6 +218,13 @@ struct GeneralSettings: View {
                     }
                 }
                 .padding(.leading, settingsRowTextInset)
+                if musicBlockReplacementRejected {
+                    Text(l10n.s.musicBlockReplacementBlocked)
+                        .font(.caption)
+                        .foregroundStyle(.orange)
+                        .fixedSize(horizontal: false, vertical: true)
+                        .padding(.leading, settingsRowTextInset)
+                }
             }
         }
     }
@@ -218,6 +247,8 @@ struct GeneralSettings: View {
     }
 
     private func chooseMusicReplacement() {
+        // The note answers the pick being made now, so a cancel clears it too.
+        musicBlockReplacementRejected = false
         let panel = NSOpenPanel()
         panel.canChooseDirectories = false
         panel.allowsMultipleSelection = false
@@ -227,7 +258,10 @@ struct GeneralSettings: View {
         guard panel.runModal() == .OK, let url = panel.url else { return }
         // Picking the blocked app itself would start a launch-and-kill loop.
         if let bundleID = Bundle(url: url)?.bundleIdentifier,
-           MusicLaunchBlocker.blockedBundleIDs.contains(bundleID) { return }
+           MusicLaunchBlocker.blockedBundleIDs.contains(bundleID) {
+            musicBlockReplacementRejected = true
+            return
+        }
         musicBlockReplacementPath = url.path
     }
 }
